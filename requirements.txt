@@ -1,0 +1,13 @@
+pandas
+numpy
+scikit-learn
+yfinance
+feedparser
+vaderSentiment
+requests
+beautifulsoup4
+xgboost
+lightgbm
+streamlit
+joblib
+openpyxl

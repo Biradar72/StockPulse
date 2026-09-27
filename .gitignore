@@ -1,0 +1,35 @@
+# Trained model files
+models/**/*.joblib
+models/**/*.pkl
+modeling/results/
+
+# Generated results
+results/*.csv
+results/*.json
+modeling/results/*.csv
+
+# Data
+data/01_price_data/
+data/02_news_data/csv/
+data/03_clean_news/
+data/04_news_features/
+data/05_final_dataset/
+data/06_macro_data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

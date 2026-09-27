@@ -1,0 +1,1 @@
+StockPulse complete Google News edition. No Marketaux and no synthetic news. Run: pip install -r requirements.txt; python collection/google_news.py --ticker TCS.BO --company "Tata Consultancy Services" --sector IT; python run_25_stocks.py; streamlit run app/streamlit_app.py
