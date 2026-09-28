@@ -8,6 +8,11 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 MARKET_CUTOFF_HOUR = 15
 MARKET_CUTOFF_MINUTE = 30
 
+# Only news from the last N days affects a given trading day.
+# Without this window news_count grows forever (it counted every
+# article ever published), which is a trend, not a signal.
+NEWS_LOOKBACK_DAYS = 30
+
 analyzer = SentimentIntensityAnalyzer()
 
 
@@ -289,8 +294,18 @@ def filter_market_cutoff(
         )
     )
 
+    window_start = (
+        current_date
+        -
+        pd.Timedelta(
+            days=NEWS_LOOKBACK_DAYS
+        )
+    )
+
     return news[
-        news["date"] <= cutoff
+        (news["date"] <= cutoff)
+        &
+        (news["date"] > window_start)
     ].copy()
 
 

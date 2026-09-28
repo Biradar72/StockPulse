@@ -16,6 +16,34 @@ MACRO_DIR = (
 )
 
 
+# Series whose day-t close happens AFTER the Indian market
+# closes at 15:30 IST (US equities, NYMEX/COMEX futures, FX
+# daily bars stamped at London/NY close). Their day-t value is
+# not known at Indian close on day t, so they are lagged by one
+# of their own trading days to avoid look-ahead.
+CLOSES_AFTER_INDIA = {
+    "usd_inr",
+    "crude_oil",
+    "gold",
+    "sp500"
+}
+
+RETURN_HORIZONS = [1, 5, 20]
+
+# Raw index / price levels drift over the years and are not
+# model inputs; their returns are. india_vix is mean-reverting
+# and is kept as a level.
+MACRO_LEVEL_COLUMNS = [
+    "nifty50",
+    "nifty_bank",
+    "usd_inr",
+    "crude_oil",
+    "gold",
+    "sp500",
+    "nikkei"
+]
+
+
 def _load_csv(
     path
 ):
@@ -226,6 +254,38 @@ def load_macro_data(
             }
         )
 
+        # Returns are computed on the series' own calendar,
+        # before merging with other markets' holidays.
+        df = (
+            df
+            .dropna(subset=[prefix])
+            .sort_values("Date")
+            .drop_duplicates(subset=["Date"])
+            .reset_index(drop=True)
+        )
+
+        for n in RETURN_HORIZONS:
+
+            df[
+                f"{prefix}_ret_{n}d"
+            ] = (
+                df[prefix]
+                .pct_change(n)
+            )
+
+        if prefix in CLOSES_AFTER_INDIA:
+
+            value_cols = [
+                c
+                for c in df.columns
+                if c != "Date"
+            ]
+
+            df[value_cols] = (
+                df[value_cols]
+                .shift(1)
+            )
+
         frames.append(
             df
         )
@@ -303,21 +363,6 @@ def load_macro_data(
         macro[value_columns] = (
             macro[value_columns]
             .ffill()
-        )
-
-    # ========================================================
-    # RETURNS
-    # ========================================================
-
-    for col in list(
-        value_columns
-    ):
-
-        macro[
-            f"{col}_ret_1d"
-        ] = (
-            macro[col]
-            .pct_change()
         )
 
     macro = macro.replace(

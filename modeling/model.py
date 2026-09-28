@@ -22,8 +22,6 @@ from sklearn.metrics import (
     confusion_matrix
 )
 
-from sklearn.isotonic import IsotonicRegression
-
 from sklearn.feature_selection import (
     SelectKBest,
     mutual_info_classif
@@ -31,6 +29,9 @@ from sklearn.feature_selection import (
 
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+
+from processing.technical import PRICE_LEVEL_COLUMNS
+from collection.macro_data import MACRO_LEVEL_COLUMNS
 
 
 # ============================================================
@@ -52,6 +53,26 @@ MAX_FEATURES = 50
 MIN_SAMPLES = 300
 
 MIN_CALIBRATION_SAMPLES = 50
+
+# Predict the direction of the close TARGET_HORIZON trading days
+# ahead (1 = next day).
+TARGET_HORIZON = 1
+
+# Training rows whose forward move is smaller than
+# TRAIN_DEAD_ZONE x (20-day daily volatility) are dropped from
+# TRAINING only. Such days are mostly noise and teach the model
+# nothing. Calibration and test keep every day, so the reported
+# accuracy is not inflated. 0 disables the filter.
+TRAIN_DEAD_ZONE = 0.0
+
+# A row is dropped if more than this fraction of its features is
+# missing (the first ~200 days, before sma_200 exists).
+MAX_MISSING_FRACTION = 0.10
+
+# Accuracy is also reported on the most confident X% of test
+# days. The confidence cut-off is chosen on the calibration set,
+# never on the test set.
+COVERAGE_LEVELS = [0.10, 0.20, 0.30, 0.50]
 
 
 # ============================================================
@@ -139,8 +160,15 @@ def prepare_features(
         "Future_Price",
 
         "label",
-        "Label"
+        "Label",
+
+        # Forward return used for the dead-zone filter
+        "Future_Return_H"
     }
+
+    # Non-stationary rupee / index levels
+    exclude.update(PRICE_LEVEL_COLUMNS)
+    exclude.update(MACRO_LEVEL_COLUMNS)
 
     feature_cols = [
         c
@@ -393,17 +421,22 @@ def select_features(
 
 def build_models():
 
+    # Daily stock returns are mostly noise, so every model is
+    # heavily regularised: shallow trees, large leaves, row and
+    # column subsampling. Deep trees memorise the training years
+    # and score ~50% on unseen years.
+
     return {
 
         "xgb": XGBClassifier(
-            n_estimators=400,
-            max_depth=4,
-            learning_rate=0.035,
-            min_child_weight=5,
-            subsample=0.85,
-            colsample_bytree=0.80,
-            reg_alpha=0.10,
-            reg_lambda=2.0,
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.02,
+            min_child_weight=20,
+            subsample=0.70,
+            colsample_bytree=0.60,
+            reg_alpha=1.0,
+            reg_lambda=5.0,
             objective="binary:logistic",
             eval_metric="logloss",
             random_state=RANDOM_STATE,
@@ -411,15 +444,16 @@ def build_models():
         ),
 
         "lgbm": LGBMClassifier(
-            n_estimators=400,
-            max_depth=5,
-            learning_rate=0.035,
-            num_leaves=24,
-            min_child_samples=20,
-            subsample=0.85,
-            colsample_bytree=0.80,
-            reg_alpha=0.10,
-            reg_lambda=2.0,
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.02,
+            num_leaves=8,
+            min_child_samples=50,
+            subsample=0.70,
+            subsample_freq=1,
+            colsample_bytree=0.60,
+            reg_alpha=1.0,
+            reg_lambda=5.0,
             class_weight="balanced",
             random_state=RANDOM_STATE,
             verbosity=-1,
@@ -427,9 +461,9 @@ def build_models():
         ),
 
         "rf": RandomForestClassifier(
-            n_estimators=500,
-            max_depth=9,
-            min_samples_leaf=5,
+            n_estimators=300,
+            max_depth=6,
+            min_samples_leaf=30,
             max_features="sqrt",
             class_weight="balanced_subsample",
             random_state=RANDOM_STATE,
@@ -437,16 +471,16 @@ def build_models():
         ),
 
         "gb": GradientBoostingClassifier(
-            n_estimators=300,
-            learning_rate=0.035,
-            max_depth=3,
-            min_samples_leaf=5,
-            subsample=0.85,
+            n_estimators=150,
+            learning_rate=0.03,
+            max_depth=2,
+            min_samples_leaf=30,
+            subsample=0.70,
             random_state=RANDOM_STATE
         ),
 
         "lr": LogisticRegression(
-            C=0.35,
+            C=0.05,
             class_weight="balanced",
             max_iter=3000,
             random_state=RANDOM_STATE
@@ -616,69 +650,154 @@ def indicator_agreement(row):
 # CALIBRATION
 # ============================================================
 
+class PlattCalibrator:
+
+    """
+    Platt scaling: a 1-D logistic regression on the logit of the
+    ensemble probability. A class (not a lambda) so the model
+    bundle can be saved with joblib. With no fitted model it
+    returns probabilities unchanged.
+    """
+
+    def __init__(self):
+
+        self.model = None
+
+    @staticmethod
+    def _logit(p):
+
+        p = np.clip(
+            np.asarray(p, dtype=float),
+            1e-6,
+            1 - 1e-6
+        )
+
+        return np.log(
+            p / (1 - p)
+        ).reshape(-1, 1)
+
+    def fit(self, raw_probabilities, y):
+
+        self.model = LogisticRegression(
+            C=1.0
+        )
+
+        self.model.fit(
+            self._logit(raw_probabilities),
+            y
+        )
+
+        return self
+
+    def __call__(self, raw_probabilities):
+
+        if self.model is None:
+
+            return np.asarray(
+                raw_probabilities
+            )
+
+        return self.model.predict_proba(
+            self._logit(raw_probabilities)
+        )[:, 1]
+
+
 def calibrate_probabilities(
     y_cal,
     raw_probabilities
 ):
 
+    # Isotonic regression on ~240 calibration rows produced a
+    # step function with only a few distinct outputs, which often
+    # pushed every test day to the same side of 0.5. Platt
+    # scaling is smooth and monotone.
+
     y_cal = np.asarray(
         y_cal
     )
 
-    raw_probabilities = np.asarray(
-        raw_probabilities
-    )
-
-    if len(y_cal) < MIN_CALIBRATION_SAMPLES:
-
-        return (
-            lambda x: np.asarray(x),
-            False
-        )
-
-    if len(
-        np.unique(y_cal)
-    ) < 2:
+    if (
+        len(y_cal) < MIN_CALIBRATION_SAMPLES
+        or len(np.unique(y_cal)) < 2
+    ):
 
         return (
-            lambda x: np.asarray(x),
+            PlattCalibrator(),
             False
         )
-
-    if len(
-        np.unique(
-            np.round(
-                raw_probabilities,
-                6
-            )
-        )
-    ) < 4:
-
-        return (
-            lambda x: np.asarray(x),
-            False
-        )
-
-    calibrator = IsotonicRegression(
-        y_min=0.0,
-        y_max=1.0,
-        out_of_bounds="clip"
-    )
-
-    calibrator.fit(
-        raw_probabilities,
-        y_cal
-    )
 
     print(
         "[CALIBRATION] "
-        "Isotonic calibration applied."
+        "Platt calibration applied."
     )
 
     return (
-        calibrator.predict,
+        PlattCalibrator().fit(
+            raw_probabilities,
+            y_cal
+        ),
         True
     )
+
+
+# ============================================================
+# ACCURACY BY CONFIDENCE COVERAGE
+# ============================================================
+
+def coverage_accuracy(
+    cal_prob,
+    test_prob,
+    y_test
+):
+
+    """
+    For each coverage level c, find the confidence cut-off that
+    keeps the top c fraction of CALIBRATION days, then report the
+    accuracy on test days that pass that cut-off.
+    """
+
+    cal_conf = np.abs(
+        np.asarray(cal_prob) - 0.5
+    )
+
+    test_conf = np.abs(
+        np.asarray(test_prob) - 0.5
+    )
+
+    y_test = np.asarray(
+        y_test
+    )
+
+    test_pred = (
+        np.asarray(test_prob) >= 0.5
+    ).astype(int)
+
+    out = {}
+
+    for level in COVERAGE_LEVELS:
+
+        key = f"top{int(level * 100)}"
+
+        cutoff = np.quantile(
+            cal_conf,
+            1 - level
+        )
+
+        mask = test_conf >= cutoff
+
+        out[f"acc_{key}"] = (
+            float(
+                (test_pred[mask] == y_test[mask]).mean()
+            )
+            if mask.sum() > 0
+            else np.nan
+        )
+
+        out[f"n_{key}"] = int(
+            mask.sum()
+        )
+
+    return out
 
 
 # ============================================================
@@ -944,25 +1063,37 @@ def train_model(
             confidence
         )
 
+        # agreement is the share of BULLISH indicators, so an UP
+        # signal needs agreement >= threshold and a DOWN signal
+        # needs agreement <= 1 - threshold.
+
         if (
             confidence
             >= CONFIDENCE_THRESHOLD
+            and
+            prob >= 0.50
             and
             agreement
             >= AGREEMENT_THRESHOLD
         ):
 
-            if prob >= 0.50:
+            signals.append(
+                "UP"
+            )
 
-                signals.append(
-                    "UP"
-                )
+        elif (
+            confidence
+            >= CONFIDENCE_THRESHOLD
+            and
+            prob < 0.50
+            and
+            agreement
+            <= 1 - AGREEMENT_THRESHOLD
+        ):
 
-            else:
-
-                signals.append(
-                    "DOWN"
-                )
+            signals.append(
+                "DOWN"
+            )
 
         else:
 
@@ -1066,6 +1197,19 @@ def train_model(
 
         "accuracy":
             float(accuracy),
+
+        "always_up_accuracy":
+            float(
+                np.mean(
+                    np.asarray(y_test)
+                )
+            ),
+
+        **coverage_accuracy(
+            cal_prob,
+            test_prob,
+            y_test
+        ),
 
         "precision":
             float(precision),

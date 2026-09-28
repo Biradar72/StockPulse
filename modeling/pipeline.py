@@ -20,7 +20,10 @@ from modeling.model import (
     train_model,
     MIN_SAMPLES,
     TEST_RATIO,
-    CALIBRATION_RATIO
+    CALIBRATION_RATIO,
+    TARGET_HORIZON,
+    TRAIN_DEAD_ZONE,
+    MAX_MISSING_FRACTION
 )
 
 
@@ -168,7 +171,10 @@ def load_news_data(ticker):
 # BUILD TARGET
 # ============================================================
 
-def create_target(df):
+def create_target(
+    df,
+    horizon=TARGET_HORIZON
+):
 
     df = df.copy()
 
@@ -177,7 +183,7 @@ def create_target(df):
     # ---------------------------------------------------------
 
     df["Next_Close"] = (
-        df["Close"].shift(-1)
+        df["Close"].shift(-horizon)
     )
 
     df["Target"] = (
@@ -185,8 +191,79 @@ def create_target(df):
         > df["Close"]
     ).astype(int)
 
-    # Last row has no future close
-    df = df.iloc[:-1].copy()
+    # Kept only for the training dead-zone filter;
+    # excluded from features in prepare_features().
+    df["Future_Return_H"] = (
+        df["Next_Close"]
+        / df["Close"]
+    ) - 1
+
+    # Last rows have no future close
+    df = df.iloc[:-horizon].copy()
+
+    return df
+
+
+# ============================================================
+# MARKET-RELATIVE FEATURES
+# ============================================================
+
+def add_market_features(df):
+
+    """
+    Relate the stock to the overall market (NIFTY 50). Most of a
+    large-cap stock's daily move is the market's move; the part
+    that is specific to the stock is more informative.
+    """
+
+    if "nifty50_ret_1d" not in df.columns:
+
+        return df
+
+    df = df.copy()
+
+    market = df["nifty50_ret_1d"]
+
+    for n in [1, 5, 20]:
+
+        if (
+            f"ret_{n}d" in df.columns
+            and f"nifty50_ret_{n}d" in df.columns
+        ):
+
+            df[f"excess_ret_{n}d"] = (
+                df[f"ret_{n}d"]
+                - df[f"nifty50_ret_{n}d"]
+            )
+
+    cov = (
+        df["ret_1d"]
+        .rolling(60)
+        .cov(market)
+    )
+
+    var = (
+        market
+        .rolling(60)
+        .var()
+    )
+
+    df["beta_60"] = (
+        cov
+        / (var + 1e-12)
+    )
+
+    df["corr_market_60"] = (
+        df["ret_1d"]
+        .rolling(60)
+        .corr(market)
+    )
+
+    df["excess_vol_20"] = (
+        (df["ret_1d"] - market)
+        .rolling(20)
+        .std()
+    )
 
     return df
 
@@ -382,6 +459,10 @@ def build_dataset(
             f"[WARN] Macro data skipped: {e}"
         )
 
+    df = add_market_features(
+        df
+    )
+
     # ---------------------------------------------------------
     # Create target LAST
     # ---------------------------------------------------------
@@ -497,8 +578,11 @@ def run(
         # Remove rows where features are completely unusable
         # -----------------------------------------------------
 
+        # Drop the warm-up period (long moving averages not yet
+        # defined) instead of median-imputing it.
         valid_mask = (
-            X.notna().sum(axis=1) > 0
+            X.isna().mean(axis=1)
+            <= MAX_MISSING_FRACTION
         )
 
         X = X.loc[
@@ -533,10 +617,19 @@ def run(
             n * CALIBRATION_RATIO
         )
 
+        # With a multi-day horizon the last target of one block
+        # overlaps the first days of the next block. An embargo
+        # of `horizon` rows between blocks prevents that leak.
+        gap = max(
+            TARGET_HORIZON - 1,
+            0
+        )
+
         train_size = (
             n
             - calibration_size
             - test_size
+            - 2 * gap
         )
 
         if train_size <= 0:
@@ -552,6 +645,14 @@ def run(
             f"Test={test_size}"
         )
 
+        cal_start = train_size + gap
+
+        test_start = (
+            cal_start
+            + calibration_size
+            + gap
+        )
+
         X_train = X.iloc[
             :train_size
         ].copy()
@@ -561,27 +662,57 @@ def run(
         ].copy()
 
         X_cal = X.iloc[
-            train_size:
-            train_size + calibration_size
+            cal_start:
+            cal_start + calibration_size
         ].copy()
 
         y_cal = y.iloc[
-            train_size:
-            train_size + calibration_size
+            cal_start:
+            cal_start + calibration_size
         ].copy()
 
         X_test = X.iloc[
-            train_size + calibration_size:
+            test_start:
         ].copy()
 
         y_test = y.iloc[
-            train_size + calibration_size:
+            test_start:
         ].copy()
 
         # Corresponding raw rows for indicator agreement
         test_rows = df_model.iloc[
-            train_size + calibration_size:
+            test_start:
         ].copy()
+
+        # -----------------------------------------------------
+        # Training dead zone (training rows only)
+        # -----------------------------------------------------
+
+        if TRAIN_DEAD_ZONE > 0:
+
+            train_rows = df_model.iloc[
+                :train_size
+            ]
+
+            threshold = (
+                TRAIN_DEAD_ZONE
+                * train_rows["vol_20"]
+                * np.sqrt(TARGET_HORIZON)
+            )
+
+            keep = (
+                train_rows["Future_Return_H"].abs()
+                >= threshold
+            ).values
+
+            X_train = X_train.loc[keep]
+
+            y_train = y_train.loc[keep]
+
+            print(
+                f"[DEAD ZONE] Dropped {int((~keep).sum())} "
+                f"low-move training rows."
+            )
 
         # -----------------------------------------------------
         # Train model
@@ -703,6 +834,11 @@ def run(
             f"{metrics['signal_count']}\n"
             f"Signal Acc: "
             f"{metrics['signal_accuracy']}\n"
+            f"Always-UP: "
+            f"{metrics['always_up_accuracy']:.4f}\n"
+            f"Top-20% confidence acc: "
+            f"{metrics['acc_top20']:.4f} "
+            f"(n={metrics['n_top20']})\n"
         )
 
         return metrics
