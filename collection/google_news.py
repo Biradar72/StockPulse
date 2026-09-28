@@ -8,7 +8,7 @@ Improved Google News scraper:
 - Saves to CSV cache
 """
 import time, hashlib, urllib.parse, urllib.request, xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import feedparser
@@ -26,7 +26,9 @@ def _title_hash(t):
 def _parse_date(entry):
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         try:
-            return datetime(*entry.published_parsed[:6])
+            # published_parsed is UTC; the pipeline compares against
+            # the 15:30 IST market close, so convert to naive IST.
+            return datetime(*entry.published_parsed[:6]) + timedelta(hours=5, minutes=30)
         except:
             pass
     return None

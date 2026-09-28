@@ -2,6 +2,33 @@ import numpy as np
 import pandas as pd
 
 
+# ============================================================
+# NON-STATIONARY COLUMNS
+# ============================================================
+#
+# These columns are measured in rupees (or raw share counts),
+# so their values drift with the price level. A tree trained on
+# 2017 prices (e.g. sma_20 = 1500) cannot generalise to 2026
+# prices (sma_20 = 4000). They stay in the DataFrame for
+# indicator_agreement() and charts, but must never be model
+# inputs. Their scale-free ratio versions are used instead.
+
+PRICE_LEVEL_COLUMNS = (
+    [f"sma_{n}" for n in [5, 10, 20, 50, 100, 200]]
+    + [f"ema_{n}" for n in [5, 10, 12, 20, 26, 50, 100, 200]]
+    + [f"atr_{n}" for n in [7, 14, 21]]
+    + [f"volume_sma_{n}" for n in [5, 10, 20, 50]]
+    + [
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "bb_mid",
+        "bb_upper",
+        "bb_lower",
+    ]
+)
+
+
 def add_technical(df):
     """
     Add technical indicators using only current/past market data.
@@ -492,8 +519,110 @@ def add_technical(df):
     ).astype(int)
 
     # ========================================================
+    # SCALE-FREE MACD
+    # ========================================================
+
+    x["macd_signal_pct"] = (
+        x["macd_signal"]
+        / (c + 1e-9)
+    )
+
+    x["macd_hist_pct"] = (
+        x["macd_hist"]
+        / (c + 1e-9)
+    )
+
+    # ========================================================
+    # LAGGED RETURNS / SHORT-TERM REVERSAL
+    # ========================================================
+
+    for n in [1, 2, 3, 5]:
+
+        x[f"ret_lag{n}"] = (
+            x["ret_1d"].shift(n)
+        )
+
+    x["up_days_5"] = (
+        (x["ret_1d"] > 0)
+        .astype(float)
+        .rolling(5)
+        .mean()
+    )
+
+    x["up_days_20"] = (
+        (x["ret_1d"] > 0)
+        .astype(float)
+        .rolling(20)
+        .mean()
+    )
+
+    # Return normalised by its own recent volatility
+    x["ret_1d_z"] = (
+        x["ret_1d"]
+        / (x["vol_20"] + 1e-9)
+    )
+
+    x["ret_5d_z"] = (
+        x["ret_5d"]
+        / (x["vol_20"] * np.sqrt(5) + 1e-9)
+    )
+
+    # ========================================================
+    # CLOSE LOCATION / VOLATILITY REGIME
+    # ========================================================
+
+    x["close_location"] = (
+        (c - l)
+        / (h - l + 1e-9)
+    )
+
+    x["vol_ratio_5_20"] = (
+        x["vol_5"]
+        / (x["vol_20"] + 1e-9)
+    )
+
+    x["vol_ratio_20_60"] = (
+        x["vol_20"]
+        / (x["vol_60"] + 1e-9)
+    )
+
+    x["ret_skew_20"] = (
+        x["ret_1d"]
+        .rolling(20)
+        .skew()
+    )
+
+    x["drawdown_60"] = (
+        c
+        / (c.rolling(60).max() + 1e-9)
+    ) - 1
+
+    x["log_volume_ratio_5_50"] = np.log(
+        (x["volume_sma_5"] + 1)
+        / (x["volume_sma_50"] + 1)
+    )
+
+    # ========================================================
+    # CALENDAR
+    # ========================================================
+
+    if "Date" in x.columns:
+
+        dates = pd.to_datetime(
+            x["Date"],
+            errors="coerce"
+        )
+
+        x["day_of_week"] = dates.dt.dayofweek
+
+        x["month"] = dates.dt.month
+
+    # ========================================================
     # CLEANUP
     # ========================================================
+
+    # Defragment after adding columns one by one
+    x = x.copy()
 
     x = x.replace(
         [np.inf, -np.inf],
